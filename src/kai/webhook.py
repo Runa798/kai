@@ -1,31 +1,38 @@
 """
-Webhook HTTP server for receiving external notifications and scheduling jobs.
+Webhook HTTP server for receiving external notifications, scheduling jobs, and
+optionally serving as the Telegram update transport.
 
 Provides functionality to:
-1. Receive and validate GitHub webhook events (push, PR, issues, comments, reviews)
-2. Accept generic webhook notifications from any source
-3. Expose a scheduling API for creating cron-style jobs via HTTP
-4. Expose a jobs query API for listing and fetching scheduled jobs
-5. Proxy authenticated requests to external services (service layer)
-6. Send files from the workspace to the Telegram chat (file exchange API)
+1. Receive Telegram updates via webhook (when TELEGRAM_WEBHOOK_URL is configured)
+2. Receive and validate GitHub webhook events (push, PR, issues, comments, reviews)
+3. Accept generic webhook notifications from any source
+4. Expose a scheduling API for creating cron-style jobs via HTTP
+5. Expose a jobs query API for listing and fetching scheduled jobs
+6. Proxy authenticated requests to external services (service layer)
+7. Send files from the workspace to the Telegram chat (file exchange API)
 
-The server runs on aiohttp alongside the Telegram bot in the same event loop.
-Routes are organized into five groups:
-    - /webhook/github       — GitHub events with HMAC-SHA256 signature validation
-    - /webhook              — Generic webhooks with shared-secret auth
-    - /api/schedule         — Job creation API (used by inner Claude via curl)
-    - /api/jobs             — Job listing and detail API
-    - /api/jobs/{id}        — Job detail (GET), deletion (DELETE), and update (PATCH)
-    - /api/services/{name}  — External service proxy (injects auth from .env)
-    - /api/send-file        — Send a file from the filesystem to the Telegram chat
+The server always runs on aiohttp alongside the Telegram bot in the same event
+loop, regardless of transport mode. In polling mode, Telegram updates arrive via
+the Updater in main.py; this server still handles everything else.
 
-All webhook/API endpoints (except /health) require WEBHOOK_SECRET to be set.
-When unset, only the health check endpoint is registered. This allows the
-server to start cleanly in development without exposing unauthenticated routes.
+Routes are organized into these groups:
+    - /webhook/telegram     - Telegram updates (webhook mode only, secret_token auth)
+    - /webhook/github       - GitHub events with HMAC-SHA256 signature validation
+    - /webhook              - Generic webhooks with shared-secret auth
+    - /api/schedule         - Job creation API (used by inner Claude via curl)
+    - /api/jobs             - Job listing and detail API
+    - /api/jobs/{id}        - Job detail (GET), deletion (DELETE), and update (PATCH)
+    - /api/services/{name}  - External service proxy (injects auth from .env)
+    - /api/send-file        - Send a file from the filesystem to the Telegram chat
+
+The Telegram webhook route uses its own secret (TELEGRAM_WEBHOOK_SECRET) and is
+only registered in webhook mode. All other webhook/API endpoints require
+WEBHOOK_SECRET. When WEBHOOK_SECRET is unset, only /health is active (plus
+/webhook/telegram if in webhook mode).
 
 GitHub events are formatted into human-readable Markdown messages and sent
 to the configured Telegram chat. The formatter pattern (dispatch dict mapping
-event type → formatter function) makes it easy to add new event types.
+event type to formatter function) makes it easy to add new event types.
 """
 
 import hashlib
@@ -36,6 +43,7 @@ import re
 from pathlib import Path
 
 from aiohttp import web
+from telegram import Update
 
 from kai import cron, sessions
 
@@ -44,6 +52,9 @@ log = logging.getLogger(__name__)
 # Module-level server state, managed by start() and stop()
 _app: web.Application | None = None
 _runner: web.AppRunner | None = None
+# Tracks whether we registered a Telegram webhook with the API, so stop()
+# knows whether to call delete_webhook(). Only True in webhook mode.
+_webhook_registered: bool = False
 
 
 def _strip_markdown(text: str) -> str:
@@ -198,6 +209,43 @@ def _verify_github_signature(secret: str, body: bytes, signature: str) -> bool:
 async def _handle_health(request: web.Request) -> web.Response:
     """Health check endpoint. Returns {"status": "ok"} for uptime monitoring."""
     return web.json_response({"status": "ok"})
+
+
+async def _handle_telegram_update(request: web.Request) -> web.Response:
+    """
+    Receive a Telegram update pushed via webhook.
+
+    Validates the X-Telegram-Bot-Api-Secret-Token header against the configured
+    secret, deserializes the JSON body into a python-telegram-bot Update object,
+    and dispatches it to the existing handler system via process_update().
+
+    Always returns 200 on valid-secret requests, even on errors. Telegram retries
+    on non-200 responses, so surfacing internal errors as HTTP errors would cause
+    an infinite retry loop. Errors are logged instead.
+    """
+    secret = request.app["telegram_webhook_secret"]
+    provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(provided, secret):
+        log.warning("Telegram update: invalid secret")
+        return web.Response(status=401, text="Invalid secret")
+
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        log.warning("Telegram update: malformed JSON")
+        return web.Response(status=200)
+
+    telegram_app = request.app["telegram_app"]
+    bot = request.app["telegram_bot"]
+
+    try:
+        update = Update.de_json(data, bot)
+        if update:
+            await telegram_app.process_update(update)
+    except Exception:
+        log.exception("Error processing Telegram update")
+
+    return web.Response(status=200)
 
 
 async def _handle_github(request: web.Request) -> web.Response:
@@ -686,20 +734,21 @@ async def _handle_send_file(request: web.Request) -> web.Response:
 
 async def start(telegram_app, config) -> None:
     """
-    Start the webhook HTTP server on the configured port.
+    Start the HTTP server and optionally register the Telegram webhook.
 
-    Sets up all routes and stores references to the Telegram app/bot and
-    webhook secret in the aiohttp app dict so route handlers can access them.
-    The first allowed user ID is used as the notification target chat.
+    The HTTP server always starts regardless of transport mode - it serves the
+    scheduling API, GitHub webhooks, file exchange, and health check. The
+    Telegram webhook route and set_webhook API call are only added/made when
+    config.telegram_webhook_url is set (webhook mode).
 
-    Webhook and scheduling routes are only registered if WEBHOOK_SECRET is
-    set — otherwise only the /health endpoint is available.
+    In polling mode, the server still runs but Telegram updates arrive via
+    the Updater's long-polling loop in main.py instead.
 
     Args:
         telegram_app: The python-telegram-bot Application instance.
         config: The application Config instance.
     """
-    global _app, _runner
+    global _app, _runner, _webhook_registered
 
     _app = web.Application()
     _app["telegram_app"] = telegram_app
@@ -714,6 +763,12 @@ async def start(telegram_app, config) -> None:
 
     _app.router.add_get("/health", _handle_health)
 
+    # Only register the Telegram webhook route in webhook mode. In polling mode,
+    # there's no need for the endpoint and no secret to validate against.
+    if config.telegram_webhook_url:
+        _app["telegram_webhook_secret"] = config.telegram_webhook_secret
+        _app.router.add_post("/webhook/telegram", _handle_telegram_update)
+
     if config.webhook_secret:
         _app.router.add_post("/webhook/github", _handle_github)
         _app.router.add_post("/webhook", _handle_generic)
@@ -725,24 +780,54 @@ async def start(telegram_app, config) -> None:
         _app.router.add_post("/api/services/{name}", _handle_service_call)
         _app.router.add_post("/api/send-file", _handle_send_file)
     else:
-        log.warning("WEBHOOK_SECRET not set — webhook and scheduling endpoints disabled")
+        log.warning("WEBHOOK_SECRET not set - webhook and scheduling endpoints disabled")
 
     _runner = web.AppRunner(_app, access_log=None)
     await _runner.setup()
-    # Bind to localhost only — all external access routes through Cloudflare Tunnel,
+    # Bind to localhost only - all external access routes through Cloudflare Tunnel,
     # so there's no reason to expose the server on the LAN.
     site = web.TCPSite(_runner, "127.0.0.1", config.webhook_port)
     await site.start()
     log.info("Webhook server listening on port %d", config.webhook_port)
 
+    # Register the webhook URL with Telegram's API if in webhook mode. This must
+    # come after the server is listening so the endpoint is ready before Telegram
+    # starts pushing. allowed_updates limits which update types Telegram sends -
+    # Kai only handles messages and callback queries (inline keyboard taps).
+    if config.telegram_webhook_url:
+        await telegram_app.bot.set_webhook(
+            url=config.telegram_webhook_url,
+            secret_token=config.telegram_webhook_secret,
+            allowed_updates=["message", "callback_query"],
+        )
+        _webhook_registered = True
+        log.info("Registered Telegram webhook: %s", config.telegram_webhook_url)
+
 
 async def stop() -> None:
     """
-    Stop the webhook server and clean up resources.
+    Deregister the Telegram webhook (if active) and stop the HTTP server.
 
-    Called during shutdown from main.py's finally block.
+    Called during shutdown from main.py's finally block. In webhook mode,
+    deregisters the webhook with Telegram first (so Telegram stops sending
+    updates to an endpoint that's about to disappear). In polling mode,
+    skips the delete_webhook call since no webhook was registered.
+
+    The delete_webhook call is wrapped in try/except because it's not critical -
+    if the network is down at shutdown time, Telegram will just overwrite the
+    stale webhook on the next set_webhook call at startup.
     """
-    global _app, _runner
+    global _app, _runner, _webhook_registered
+    # Only deregister if we registered a webhook (i.e., webhook mode was active)
+    if _webhook_registered and _app is not None:
+        telegram_bot = _app.get("telegram_bot")
+        if telegram_bot is not None:
+            try:
+                await telegram_bot.delete_webhook()
+                log.info("Deregistered Telegram webhook")
+            except Exception:
+                log.warning("Failed to deregister Telegram webhook (will re-register on next start)")
+        _webhook_registered = False
     if _runner:
         await _runner.cleanup()
         log.info("Webhook server stopped")
