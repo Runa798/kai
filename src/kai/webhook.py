@@ -940,9 +940,9 @@ async def _webhook_health_loop(bot, webhook_url: str, webhook_secret: str) -> No
                 reason = "webhook URL is empty"
 
             # Re-register if Telegram reports a recent delivery error.
-            # last_error_date is a Unix timestamp (0 or None if no errors).
+            # last_error_date is a datetime (None if no errors).
             elif info.last_error_date:
-                error_age = time.time() - info.last_error_date
+                error_age = time.time() - info.last_error_date.timestamp()
                 if error_age < _ERROR_RECENCY_THRESHOLD:
                     needs_reregister = True
                     reason = f"recent error ({int(error_age)}s ago): {info.last_error_message or 'unknown'}"
@@ -1061,14 +1061,35 @@ async def start(telegram_app, config) -> None:
     # come after the server is listening so the endpoint is ready before Telegram
     # starts pushing. allowed_updates limits which update types Telegram sends -
     # Kai only handles messages and callback queries (inline keyboard taps).
+    #
+    # Retry with backoff because Telegram's API can time out transiently,
+    # especially after a period of downtime when queued updates are flushing.
+    # Without retries, a single timeout kills the whole startup and launchd
+    # eventually gives up restarting.
     if config.telegram_webhook_url:
-        await telegram_app.bot.set_webhook(
-            url=config.telegram_webhook_url,
-            secret_token=config.telegram_webhook_secret,
-            allowed_updates=["message", "callback_query"],
-        )
-        _webhook_registered = True
-        log.info("Registered Telegram webhook: %s", config.telegram_webhook_url)
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await telegram_app.bot.set_webhook(
+                    url=config.telegram_webhook_url,
+                    secret_token=config.telegram_webhook_secret,
+                    allowed_updates=["message", "callback_query"],
+                )
+                _webhook_registered = True
+                log.info("Registered Telegram webhook: %s", config.telegram_webhook_url)
+                break
+            except Exception:
+                if attempt == max_attempts:
+                    log.exception("Failed to register webhook after %d attempts", max_attempts)
+                    raise
+                wait = 2**attempt  # 2, 4, 8, 16s
+                log.warning(
+                    "Webhook registration attempt %d/%d failed, retrying in %ds",
+                    attempt,
+                    max_attempts,
+                    wait,
+                )
+                await asyncio.sleep(wait)
 
         # Start the background health monitor to detect and recover from
         # Telegram delivery failures (e.g., Cloudflare tunnel drops causing
