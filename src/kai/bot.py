@@ -143,6 +143,16 @@ _QUEUED_MESSAGE_MARKER = (
     "Their previous task is done. Focus on this new message.]\n\n"
 )
 
+# Placeholder messages the user sends to prompt continuation. These are
+# intentionally content-free — the user is signalling "keep going", not
+# asking a new question. Replace with a system cue instead of forwarding
+# the raw punctuation to Claude.
+_PLACEHOLDER_MESSAGES: frozenset[str] = frozenset({".", "..", "..."})
+_CONTINUE_PROMPT = (
+    "[The user sent a placeholder message to prompt you to continue. "
+    "Resume or complete your previous response.]"
+)
+
 # Safety-net timeout for acquiring the per-chat lock (seconds). If the
 # wall-clock timeout in claude.py doesn't fire for some reason, this
 # prevents a stuck interaction from blocking all future messages. Set
@@ -698,6 +708,11 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     stop_event = get_stop_event(chat_id)
     stop_event.set()
     claude.force_kill()
+    # Cancel any pending batched messages for this chat
+    from kai.batcher import _batchers
+    if chat_id in _batchers:
+        await _batchers[chat_id].stop()
+        del _batchers[chat_id]
     await update.message.reply_text("Stopping...")
 
 
@@ -1628,7 +1643,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat_id = _chat_id(update)
     prompt = update.message.text
+
+    if prompt.strip() in _PLACEHOLDER_MESSAGES:
+        prompt = _CONTINUE_PROMPT
+
     log_message(direction="user", chat_id=chat_id, text=prompt)
+
     claude = _get_claude(context)
     model = claude.model
 
